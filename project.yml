@@ -27,7 +27,7 @@ targets:
     settings:
       base:
         PRODUCT_NAME: Luna
-        PRODUCT_BUNDLE_IDENTIFIER: com.luma.browser
+        PRODUCT_BUNDLE_IDENTIFIER: com.luna.browser
         MARKETING_VERSION: "1.0"
         CURRENT_PROJECT_VERSION: 1
         SWIFT_VERSION: "5.0"
@@ -42,23 +42,23 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: Luna
         INFOPLIST_KEY_CFBundleName: Luna
         INFOPLIST_KEY_NSHumanReadableCopyright: ""
-        INFOPLIST_KEY_NSBluetoothWhileInUseUsageDescription: "Luma needs Bluetooth access for compatible devices."
-        INFOPLIST_KEY_NSCameraUsageDescription: "Luma needs camera access for websites that request it."
-        INFOPLIST_KEY_NSMicrophoneUsageDescription: "Luma needs microphone access for websites that request it."
-        INFOPLIST_KEY_NSDownloadsFolderUsageDescription: "Luma needs access to Downloads to save files."
+        INFOPLIST_KEY_NSBluetoothWhileInUseUsageDescription: "Luna needs Bluetooth access for compatible devices."
+        INFOPLIST_KEY_NSCameraUsageDescription: "Luna needs camera access for websites that request it."
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: "Luna needs microphone access for websites that request it."
+        INFOPLIST_KEY_NSDownloadsFolderUsageDescription: "Luna needs access to Downloads to save files."
         ENABLE_APP_SANDBOX: YES
-        ENABLE_INCOMING_NETWORK_CONNECTIONS: NO
-        ENABLE_OUTGOING_NETWORK_CONNECTIONS: YES
+        ENABLE_INCOMING_NETWORK_CONNECTIONS: NO # TODO: Enable this when we have a way to handle incoming network connections
+        ENABLE_OUTGOING_NETWORK_CONNECTIONS: YES # TODO: Enable this when we have a way to handle outgoing network connections
         ENABLE_PREVIEWS: YES
-        ENABLE_RESOURCE_ACCESS_AUDIO_INPUT: YES
-        ENABLE_RESOURCE_ACCESS_BLUETOOTH: YES
-        ENABLE_RESOURCE_ACCESS_CALENDARS: NO
-        ENABLE_RESOURCE_ACCESS_CAMERA: YES
-        ENABLE_RESOURCE_ACCESS_CONTACTS: NO
-        ENABLE_RESOURCE_ACCESS_LOCATION: NO
-        ENABLE_RESOURCE_ACCESS_PRINTING: NO
-        ENABLE_RESOURCE_ACCESS_USB: YES
-        ENABLE_USER_SELECTED_FILES: readonly
+        ENABLE_RESOURCE_ACCESS_AUDIO_INPUT: YES # TODO: Enable this when we have a way to handle audio input
+        ENABLE_RESOURCE_ACCESS_BLUETOOTH: YES # TODO: Enable this when we have a way to handle bluetooth
+        ENABLE_RESOURCE_ACCESS_CALENDARS: NO # TODO: Enable this when we have a way to handle calendars
+        ENABLE_RESOURCE_ACCESS_CAMERA: YES # TODO: Enable this when we have a way to handle camera
+        ENABLE_RESOURCE_ACCESS_CONTACTS: NO # TODO: Enable this when we have a way to handle contacts
+        ENABLE_RESOURCE_ACCESS_LOCATION: NO # TODO: Enable this when we have a way to handle location
+        ENABLE_RESOURCE_ACCESS_PRINTING: NO # TODO: Enable this when we have a way to handle printing
+        ENABLE_RESOURCE_ACCESS_USB: YES # TODO: Enable this when we have a way to handle usb
+        ENABLE_USER_SELECTED_FILES: readonly # TODO: Enable this when we have a way to handle user selected files
         PROVISIONING_PROFILE_SPECIFIER: ""
         CODE_SIGN_IDENTITY: "Apple Development"
         STRING_CATALOG_GENERATE_SYMBOLS: YES
