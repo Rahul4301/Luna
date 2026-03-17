@@ -76,8 +76,8 @@ struct BrowserShellView: View {
         return web.pageThemeForActiveTab?.isDark ?? false
     }
 
-    private var chromeText: Color { chromeTextIsLight ? Color.white : Color(white: 0.15) }
-    private var chromeTextMuted: Color { chromeTextIsLight ? Color.white.opacity(0.7) : Color(white: 0.15).opacity(0.7) }
+    private var chromeText: Color { chromeTextIsLight ? .white : .black }
+    private var chromeTextMuted: Color { chromeTextIsLight ? Color.white.opacity(0.7) : Color.black.opacity(0.7) }
 
     var body: some View {
         // Compute tab strip visibility once
@@ -105,6 +105,7 @@ struct BrowserShellView: View {
                         TabStripView(
                             tabManager: tabManager,
                             faviconURLByTab: web.faviconURLByTab,
+                            primaryTintByTab: web.primaryTintByTab,
                             contentAreaColor: chromeColor,
                             chromeTextIsLight: chromeTextIsLight,
                             onSwitch: { switchToTab($0) },
@@ -1377,6 +1378,7 @@ private struct PanelResizeHandle: View {
 private struct TabStripView: View {
     @ObservedObject var tabManager: TabManager
     let faviconURLByTab: [UUID: URL?]
+    let primaryTintByTab: [UUID: NSColor]
     let contentAreaColor: Color
     let chromeTextIsLight: Bool
     let onSwitch: (UUID) -> Void
@@ -1413,6 +1415,7 @@ private struct TabStripView: View {
                         url: tabManager.tabURL[tabId] ?? nil,
                         title: tabManager.tabTitle[tabId],
                         faviconURL: faviconURLByTab[tabId] ?? nil,
+                        primaryTint: primaryTintByTab[tabId],
                         isActive: tabManager.currentTab == tabId,
                         contentAreaColor: contentAreaColor,
                         chromeTextIsLight: chromeTextIsLight,
@@ -1497,6 +1500,7 @@ private struct TabPill: View {
     let url: URL?
     let title: String?
     let faviconURL: URL?
+    let primaryTint: NSColor?
     let isActive: Bool
     let contentAreaColor: Color
     let chromeTextIsLight: Bool
@@ -1521,8 +1525,16 @@ private struct TabPill: View {
         if url?.scheme == "luma" {
             return isActive ? .white : .white.opacity(0.7)
         }
-        if isActive { return chromeTextIsLight ? .white : Color(white: 0.15) }
+        // Active tab matches page tint; inactive tabs are neutral.
+        if isActive { return chromeTextIsLight ? .white : .black }
         return .white.opacity(0.7)
+    }
+
+    private var tabBackgroundColor: Color {
+        // Only the active tab mirrors the current page color (minimalist "page feels bigger").
+        // Inactive tabs stay neutral/dim to reduce visual noise.
+        if isActive { return contentAreaColor }
+        return Color(white: 0.22).opacity(isHovered ? 0.9 : 0.6)
     }
 
     var body: some View {
@@ -1575,9 +1587,7 @@ private struct TabPill: View {
         .onHover { isHovered = $0 }
         .background(
             RoundedRectangle(cornerRadius: 6)
-                .fill(isActive
-                    ? contentAreaColor
-                    : Color(white: 0.22).opacity(isHovered ? 0.9 : 0.6))
+                .fill(tabBackgroundColor)
         )
         .animation(.easeInOut(duration: 0.06), value: contentAreaColor)
         .animation(.easeInOut(duration: 0.06), value: isHovered)
@@ -1585,6 +1595,39 @@ private struct TabPill: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Tab \(index): \(displayTitle)")
         .accessibilityAddTraits(isActive ? [.isButton, .isSelected] : .isButton)
+    }
+}
+
+private extension TabPill {
+    static func relativeLuminance(_ color: NSColor) -> CGFloat {
+        guard let rgb = color.usingColorSpace(.deviceRGB) else { return 0 }
+        func toLinear(_ c: CGFloat) -> CGFloat {
+            (c <= 0.03928) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4)
+        }
+        let r = toLinear(rgb.redComponent)
+        let g = toLinear(rgb.greenComponent)
+        let b = toLinear(rgb.blueComponent)
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+    }
+}
+
+private extension NSColor {
+    func desaturated(multiplier: CGFloat) -> NSColor {
+        guard let rgb = usingColorSpace(.deviceRGB) else { return self }
+        var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        rgb.getHue(&h, saturation: &s, brightness: &b, alpha: &a)
+        return NSColor(hue: h, saturation: max(0, min(1, s * multiplier)), brightness: b, alpha: a)
+    }
+
+    func dimBrightness(multiplier: CGFloat) -> NSColor {
+        guard let rgb = usingColorSpace(.deviceRGB) else { return self }
+        var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        rgb.getHue(&h, saturation: &s, brightness: &b, alpha: &a)
+        return NSColor(hue: h, saturation: s, brightness: max(0, min(1, b * multiplier)), alpha: a)
+    }
+
+    func withAlpha(_ alpha: CGFloat) -> NSColor {
+        withAlphaComponent(max(0, min(1, alpha)))
     }
 }
 

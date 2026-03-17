@@ -32,7 +32,7 @@ final class WebViewWrapper: NSObject, ObservableObject, WKNavigationDelegate, WK
     /// Pending download destination info for WKDownloadDelegate (keyed by ObjectIdentifier of WKDownload).
     private var downloadDestinationByID: [ObjectIdentifier: (fileURL: URL, requestURL: URL?, suggestedFilename: String)] = [:]
 
-    /// Per-tab zoom (1.0 = 100%). Applied via document.body.style.zoom after load.
+    /// Per-tab zoom (1.0 = 100%). Applied via WKWebView.pageZoom.
     private var zoomByTab: [UUID: CGFloat] = [:]
     private let zoomMin: CGFloat = 0.5
     private let zoomMax: CGFloat = 3.0
@@ -46,12 +46,60 @@ final class WebViewWrapper: NSObject, ObservableObject, WKNavigationDelegate, WK
     
     /// Favicon URLs per tab (extracted from page <link rel="icon">)
     @Published var faviconURLByTab: [UUID: URL?] = [:]
+
+    /// Per-tab primary tint, derived from favicon (preferred) or page theme (fallback).
+    @Published var primaryTintByTab: [UUID: NSColor] = [:]
     
     /// When true, Google AI Studio showed "request is suspicious" — show in-app explanation (Google’s decision, not a Luma bug).
     @Published var googleSuspiciousErrorDetected: Bool = false
     
     /// TabManager reference for updating titles
     weak var tabManager: TabManager?
+
+    // MARK: - Color helpers
+
+    private static func relativeLuminance(_ color: NSColor) -> CGFloat {
+        guard let rgb = color.usingColorSpace(.deviceRGB) else { return 0 }
+        func toLinear(_ c: CGFloat) -> CGFloat {
+            (c <= 0.03928) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4)
+        }
+        let r = toLinear(rgb.redComponent)
+        let g = toLinear(rgb.greenComponent)
+        let b = toLinear(rgb.blueComponent)
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+    }
+
+    private static func dominantColor(from image: NSImage) -> NSColor? {
+        var proposed = CGRect(origin: .zero, size: CGSize(width: 12, height: 12))
+        guard let cgImage = image.cgImage(forProposedRect: &proposed, context: nil, hints: nil) else { return nil }
+        guard let ctx = CGContext(
+            data: nil,
+            width: 1,
+            height: 1,
+            bitsPerComponent: 8,
+            bytesPerRow: 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        ctx.interpolationQuality = .medium
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+        guard let data = ctx.data else { return nil }
+        let p = data.bindMemory(to: UInt8.self, capacity: 4)
+        return NSColor(
+            red: CGFloat(p[0]) / 255.0,
+            green: CGFloat(p[1]) / 255.0,
+            blue: CGFloat(p[2]) / 255.0,
+            alpha: CGFloat(p[3]) / 255.0
+        )
+    }
+
+    private func updatePrimaryTint(_ color: NSColor?, for tabId: UUID) {
+        if let color {
+            primaryTintByTab[tabId] = color
+        } else {
+            primaryTintByTab.removeValue(forKey: tabId)
+        }
+    }
 
     /// Single message handler for theme; added to each webview config so we know which tab sent the message via message.webView.
     private lazy var themeMessageHandler: ThemeMessageHandler = {
@@ -75,33 +123,99 @@ final class WebViewWrapper: NSObject, ObservableObject, WKNavigationDelegate, WK
                 return null;
             }
             function send(rgb) { if (rgb) window.webkit.messageHandlers.lumaPageTheme.postMessage(rgb); else window.webkit.messageHandlers.lumaPageTheme.postMessage(''); }
+            function parseRGB(rgb) {
+                if (!rgb) return null;
+                var parts = rgb.split(',');
+                if (parts.length < 3) return null;
+                var r = parseInt(parts[0],10), g = parseInt(parts[1],10), b = parseInt(parts[2],10);
+                if (isNaN(r)||isNaN(g)||isNaN(b)) return null;
+                return { r:r, g:g, b:b };
+            }
+            function relLum(rgb) {
+                function lin(c){ c = c/255; return (c<=0.03928) ? (c/12.92) : Math.pow((c+0.055)/1.055, 2.4); }
+                return 0.2126*lin(rgb.r) + 0.7152*lin(rgb.g) + 0.0722*lin(rgb.b);
+            }
+            function saturation(rgb) {
+                var r = rgb.r/255, g = rgb.g/255, b = rgb.b/255;
+                var max = Math.max(r,g,b), min = Math.min(r,g,b);
+                var d = max - min;
+                if (max === 0) return 0;
+                return d / max;
+            }
+            function score(rgbStr) {
+                var rgb = parseRGB(rgbStr);
+                if (!rgb) return -1;
+                var lum = relLum(rgb);
+                var sat = saturation(rgb);
+                // Penalize near-white / near-black and low-saturation neutrals.
+                var lumScore = 1 - Math.min(1, Math.abs(lum - 0.5) * 2);
+                var satScore = Math.min(1, sat / 0.35);
+                var neutralPenalty = (sat < 0.08) ? 0.4 : 0.0;
+                return (0.65 * satScore + 0.35 * lumScore) - neutralPenalty;
+            }
+            function pickBest(candidates) {
+                var best = null;
+                var bestScore = -1;
+                for (var i=0;i<candidates.length;i++){
+                    var c = candidates[i];
+                    if (!c) continue;
+                    var s = score(c);
+                    if (s > bestScore) { bestScore = s; best = c; }
+                }
+                return best;
+            }
             function bgFrom(el) {
                 if (!el) return null;
                 var bg = window.getComputedStyle(el).backgroundColor;
                 if (!bg || bg === 'transparent' || bg === 'rgba(0, 0, 0, 0)') return null;
                 return parseColor(bg);
             }
+            function fgFrom(el) {
+                if (!el) return null;
+                var fg = window.getComputedStyle(el).color;
+                if (!fg || fg === 'transparent' || fg === 'rgba(0, 0, 0, 0)') return null;
+                return parseColor(fg);
+            }
             function sampleTheme() {
-                var rgb = null;
+                var candidates = [];
                 var meta = document.querySelector('meta[name="theme-color"]');
-                if (meta && meta.content) rgb = parseColor(meta.content.trim());
-                if (!rgb) {
-                    var root = document.documentElement;
-                    var style = root && window.getComputedStyle(root);
-                    if (style) {
-                        var v = style.getPropertyValue('--theme-color') || style.getPropertyValue('--primary') || style.getPropertyValue('--background') || style.getPropertyValue('--bg') || style.getPropertyValue('--color-primary');
-                        if (v) rgb = parseColor(v.trim());
+                if (meta && meta.content) candidates.push(parseColor(meta.content.trim()));
+
+                // CSS variable heuristics (many modern apps theme via vars)
+                var root = document.documentElement;
+                var style = root && window.getComputedStyle(root);
+                if (style) {
+                    var vars = [
+                        '--theme-color','--primary','--color-primary','--accent','--brand','--brand-color',
+                        '--md-sys-color-primary','--md-sys-color-secondary','--md-sys-color-tertiary',
+                        '--gm3-sys-color-primary','--gm3-sys-color-secondary','--gm3-sys-color-tertiary',
+                        '--gm3-sys-color-surface-tint','--gm3-sys-color-primary-container'
+                    ];
+                    for (var vi=0;vi<vars.length;vi++){
+                        var v = style.getPropertyValue(vars[vi]);
+                        if (v) candidates.push(parseColor(v.trim()));
                     }
                 }
-                if (!rgb) rgb = bgFrom(document.body) || bgFrom(document.documentElement);
-                if (!rgb && document.body) {
-                    var candidates = document.querySelectorAll('header, [role="banner"], main, [role="main"], section, .hero, [class*="hero"], [class*="banner"], #header, .header, div');
-                    for (var i = 0; i < Math.min(candidates.length, 12); i++) {
-                        rgb = bgFrom(candidates[i]);
-                        if (rgb) break;
+
+                // Prefer top chrome-ish elements (Gmail themes often tint headers, not body background)
+                var header = document.querySelector('header, [role=\"banner\"], .gb_ua, .gb_Ba, .gb_Aa, .gb_Ca, [class*=\"header\"], [class*=\"TopBar\"], [class*=\"appbar\"], [data-ogsr-up], [aria-label*=\"Google\"]');
+                if (header) {
+                    candidates.push(bgFrom(header));
+                    candidates.push(fgFrom(header));
+                }
+
+                // Fallbacks: body/root bg then a few structural candidates
+                candidates.push(bgFrom(document.body));
+                candidates.push(bgFrom(document.documentElement));
+
+                if (document.body) {
+                    var els = document.querySelectorAll('header, [role=\"banner\"], nav, [role=\"navigation\"], main, [role=\"main\"], [class*=\"hero\"], [class*=\"banner\"], #header, .header');
+                    for (var i = 0; i < Math.min(els.length, 16); i++) {
+                        candidates.push(bgFrom(els[i]));
                     }
                 }
-                send(rgb);
+
+                send(pickBest(candidates));
             }
             sampleTheme();
             var debounceTimer = null;
@@ -364,8 +478,7 @@ final class WebViewWrapper: NSObject, ObservableObject, WKNavigationDelegate, WK
     private func applyZoom(to tabId: UUID) {
         guard let wv = webViews[tabId] else { return }
         let zoom = zoomByTab[tabId] ?? 1.0
-        let js = "document.body.style.zoom = \(zoom); document.documentElement.style.zoom = \(zoom);"
-        wv.evaluateJavaScript(js, completionHandler: nil)
+        wv.pageZoom = Double(zoom)
     }
 
     func evaluateSelectedText(in tabId: UUID, completion: @escaping (String?) -> Void) {
@@ -425,14 +538,29 @@ final class WebViewWrapper: NSObject, ObservableObject, WKNavigationDelegate, WK
             DispatchQueue.main.async {
                 if let urlString = result as? String, !urlString.isEmpty, let url = URL(string: urlString) {
                     self.faviconURLByTab[tabId] = url
+                    self.fetchPrimaryTintFromFavicon(for: tabId, faviconURL: url)
                 } else if let pageURL = webView.url, let host = pageURL.host {
                     // Fallback to /favicon.ico
-                    self.faviconURLByTab[tabId] = URL(string: "https://\(host)/favicon.ico")
+                    let url = URL(string: "https://\(host)/favicon.ico")
+                    self.faviconURLByTab[tabId] = url
+                    if let url { self.fetchPrimaryTintFromFavicon(for: tabId, faviconURL: url) }
                 } else {
                     self.faviconURLByTab[tabId] = nil
                 }
             }
         }
+    }
+
+    private func fetchPrimaryTintFromFavicon(for tabId: UUID, faviconURL: URL) {
+        var request = URLRequest(url: faviconURL)
+        request.cachePolicy = .returnCacheDataElseLoad
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+            guard let self else { return }
+            guard let data, let image = NSImage(data: data), let color = Self.dominantColor(from: image) else { return }
+            DispatchQueue.main.async {
+                self.updatePrimaryTint(color, for: tabId)
+            }
+        }.resume()
     }
     
     /// Extracts the page title from the active tab.
@@ -514,6 +642,7 @@ final class WebViewWrapper: NSObject, ObservableObject, WKNavigationDelegate, WK
         titleObservations.removeValue(forKey: tabId)
         urlObservations.removeValue(forKey: tabId)
         faviconURLByTab.removeValue(forKey: tabId)
+        primaryTintByTab.removeValue(forKey: tabId)
         webViews.removeValue(forKey: tabId)
         pageThemeByTab.removeValue(forKey: tabId)
         zoomByTab.removeValue(forKey: tabId)
@@ -675,6 +804,10 @@ final class WebViewWrapper: NSObject, ObservableObject, WKNavigationDelegate, WK
             DispatchQueue.main.async {
                 if let color = color {
                     self.pageThemeByTab[tabId] = (color, isDark)
+                    // Fallback tint when favicon tint isn't available yet.
+                    if self.primaryTintByTab[tabId] == nil {
+                        self.updatePrimaryTint(color, for: tabId)
+                    }
                 } else {
                     self.pageThemeByTab.removeValue(forKey: tabId)
                 }
@@ -708,8 +841,9 @@ final class WebViewWrapper: NSObject, ObservableObject, WKNavigationDelegate, WK
         guard parts.count >= 3 else { return (nil, false) }
         let r = min(255, max(0, parts[0])), g = min(255, max(0, parts[1])), b = min(255, max(0, parts[2]))
         let ns = NSColor(red: CGFloat(r)/255, green: CGFloat(g)/255, blue: CGFloat(b)/255, alpha: 1)
-        let luminance = (0.299 * CGFloat(r) + 0.587 * CGFloat(g) + 0.114 * CGFloat(b)) / 255
-        return (ns, luminance < 0.5)
+        // Relative luminance (WCAG). If luminance is high, background is "light" so we should use dark text.
+        let luminance = relativeLuminance(ns)
+        return (ns, luminance <= 0.5)
     }
 
     // MARK: - WKDownloadDelegate (saves to ~/Downloads, notifies DownloadManager)
