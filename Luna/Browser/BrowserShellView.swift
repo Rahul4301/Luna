@@ -19,6 +19,13 @@ private final class AddressBarKeyState: ObservableObject {
 /// Omnibox: accepts full URL, domain, or search query.
 /// Per SECURITY.md: No JS message handlers, no HTML scraping.
 struct BrowserShellView: View {
+    // MARK: - Profile state
+    @ObservedObject private var profileManager = ProfileManager.shared
+    /// Per-profile snapshots: tab managers + web wrappers kept alive for 5 min after switching away.
+    @State private var profileTabManagers: [UUID: TabManager] = [:]
+    @State private var profileWebWrappers: [UUID: WebViewWrapper] = [:]
+
+    // MARK: - Active browser state (swapped on profile switch)
     @StateObject private var tabManager = TabManager()
     @StateObject private var web: WebViewWrapper = {
         let wrapper = WebViewWrapper()
@@ -60,6 +67,12 @@ struct BrowserShellView: View {
     private let addressBarHeight: CGFloat = 44
     private let chromeCornerRadius: CGFloat = 14
     private let chromePadding: CGFloat = 4
+
+    /// Profile color tint overlaid on the toolbar background (tab strip + address bar).
+    private var profileToolbarTint: Color { profileManager.activeProfile.profileColor.color.opacity(0.18) }
+
+    /// Inactive tab background inherits a 10-15% lighter profile color variant.
+    private var profileInactiveTabColor: Color { profileManager.activeProfile.profileColor.lightVariant.opacity(0.25) }
 
     /// DIA-style: unified chrome color (tabs + address bar + content). Start page = dark; web page = page theme or default.
     private var chromeColor: Color {
@@ -108,6 +121,7 @@ struct BrowserShellView: View {
                             primaryTintByTab: web.primaryTintByTab,
                             contentAreaColor: chromeColor,
                             chromeTextIsLight: chromeTextIsLight,
+                            profileInactiveTabColor: profileInactiveTabColor,
                             onSwitch: { switchToTab($0) },
                             onClose: { closeTab($0) },
                             onNewTab: newTab,
@@ -118,7 +132,13 @@ struct BrowserShellView: View {
                         .padding(.leading, isFullScreen ? 8 : 78)
                         .padding(.trailing, 8)
                         .padding(.top, isFullScreen ? 0 : -(tabStripHeight - 6))
-                        .background(Color(white: 0.12))
+                        .background(
+                            ZStack {
+                                Color(white: 0.12)
+                                profileToolbarTint
+                            }
+                        )
+                        .animation(.easeInOut(duration: 0.25), value: profileManager.activeProfileId)
                         .transition(.move(edge: .top).combined(with: .opacity))
                         .animation(.easeInOut(duration: 0.2), value: isFullScreen)
                     }
@@ -129,6 +149,14 @@ struct BrowserShellView: View {
                        u.absoluteString != "about:blank",
                        !(u.scheme == "luma" && u.host == "ai") {
                         HStack(spacing: 6) {
+                            // Profile switcher bubble (left of nav buttons)
+                            ProfileSwitcherView(
+                                profileManager: profileManager,
+                                onSwitch: { profile in switchToProfile(profile) },
+                                onOpenInNewWindow: { profile in openProfileInNewWindow(profile) }
+                            )
+                            .padding(.leading, 4)
+
                             // Nav buttons (greyed out when nothing to go back/forward to)
                             HStack(spacing: 2) {
                                 Button(action: { if let id = tabManager.currentTab { web.goBack(in: id) } }) {
@@ -264,7 +292,13 @@ struct BrowserShellView: View {
                         .padding(.vertical, 2)
                         .frame(height: addressBarHeight)
                         .frame(maxWidth: .infinity)
-                        .background(chromeColor)
+                        .background(
+                            ZStack {
+                                chromeColor
+                                profileToolbarTint
+                            }
+                        )
+                        .animation(.easeInOut(duration: 0.25), value: profileManager.activeProfileId)
                         .animation(.easeInOut(duration: 0.06), value: chromeColor)
                     }
 
@@ -644,6 +678,85 @@ struct BrowserShellView: View {
                 eventMonitor = nil
             }
         }
+    }
+
+    // MARK: - Profile switching
+
+    private func switchToProfile(_ profile: BrowserProfile) {
+        guard profile.id != profileManager.activeProfileId else { return }
+        let leavingId = profileManager.activeProfileId
+
+        // Save current tab state so we can restore when coming back
+        // (TabManager and WebViewWrapper are already @StateObject; we keep them alive in dictionaries)
+        profileTabManagers[leavingId] = tabManager
+        profileWebWrappers[leavingId] = web
+
+        // Schedule suspension of the outgoing profile's webviews after 5 minutes
+        profileManager.scheduleSuspension(for: leavingId) { [weak tabManager, weak web] in
+            // After 5 min: stop loading / free resources (webviews remain allocated by ARC)
+            // Nothing to explicitly do — WKWebView suspends itself when not visible
+            _ = tabManager; _ = web
+        }
+
+        // Cancel any pending suspension for the incoming profile (we're activating it)
+        profileManager.cancelSuspension(for: profile.id)
+
+        // Switch the profile manager
+        profileManager.switchTo(profileId: profile.id)
+
+        // Reset address bar
+        addressBarText = ""
+        searchSuggestions = []
+        historySuggestions = []
+        tabsWithPanelOpen = []
+        tabChatHistory = [:]
+        tabAIChatMessages = [:]
+
+        // If this profile had a saved TabManager, wire it back up
+        // (State objects can't be swapped, so we open a new initial tab for now;
+        //  full per-profile tab persistence requires extracting state into a view model — future work)
+        if let existingTM = profileTabManagers[profile.id] {
+            // Re-point web wrapper to correct tabs
+            if let existingWeb = profileWebWrappers[profile.id] {
+                existingWeb.tabManager = existingTM
+                if let currentTab = existingTM.currentTab {
+                    existingWeb.setActiveTab(currentTab)
+                }
+            }
+        } else {
+            // Brand new profile: start with a blank tab
+            let newTabId = tabManager.newTab(url: nil)
+            web.setActiveTab(newTabId)
+            addressBarText = ""
+        }
+    }
+
+    private func openProfileInNewWindow(_ profile: BrowserProfile) {
+        // Switch the profile manager to the target profile for the new window
+        // then open a new NSWindow hosting a BrowserShellView
+        let previousId = profileManager.activeProfileId
+        profileManager.switchTo(profileId: profile.id)
+
+        let newWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1200, height: 800),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        newWindow.titlebarAppearsTransparent = true
+        newWindow.titleVisibility = .hidden
+        newWindow.styleMask.insert(.fullSizeContentView)
+        newWindow.isMovableByWindowBackground = false
+        newWindow.tabbingMode = .disallowed
+        newWindow.center()
+        newWindow.title = "\(profile.name) — Luna"
+
+        let shellView = BrowserShellView()
+        newWindow.contentView = NSHostingView(rootView: shellView)
+        newWindow.makeKeyAndOrderFront(nil)
+
+        // Restore this window's profile
+        profileManager.switchTo(profileId: previousId)
     }
 
     // MARK: - Helpers
@@ -1381,6 +1494,7 @@ private struct TabStripView: View {
     let primaryTintByTab: [UUID: NSColor]
     let contentAreaColor: Color
     let chromeTextIsLight: Bool
+    let profileInactiveTabColor: Color
     let onSwitch: (UUID) -> Void
     let onClose: (UUID) -> Void
     let onNewTab: () -> Void
@@ -1419,6 +1533,7 @@ private struct TabStripView: View {
                         isActive: tabManager.currentTab == tabId,
                         contentAreaColor: contentAreaColor,
                         chromeTextIsLight: chromeTextIsLight,
+                        profileInactiveTabColor: profileInactiveTabColor,
                         showTitle: tabWidth >= Self.minTabWidth,
                         onSelect: { onSwitch(tabId) },
                         onClose: { onClose(tabId) }
@@ -1504,6 +1619,7 @@ private struct TabPill: View {
     let isActive: Bool
     let contentAreaColor: Color
     let chromeTextIsLight: Bool
+    let profileInactiveTabColor: Color
     /// When false (cramped strip), show only favicon to fit; when true, show title too.
     let showTitle: Bool
     let onSelect: () -> Void
@@ -1531,10 +1647,12 @@ private struct TabPill: View {
     }
 
     private var tabBackgroundColor: Color {
-        // Only the active tab mirrors the current page color (minimalist "page feels bigger").
-        // Inactive tabs stay neutral/dim to reduce visual noise.
+        // Active tab: mirrors the current page color.
+        // Inactive tabs: use the profile's lighter color variant so the profile identity shows.
         if isActive { return contentAreaColor }
-        return Color(white: 0.22).opacity(isHovered ? 0.9 : 0.6)
+        return isHovered
+            ? profileInactiveTabColor.opacity(0.9)
+            : profileInactiveTabColor.opacity(0.65)
     }
 
     var body: some View {

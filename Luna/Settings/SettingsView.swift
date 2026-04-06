@@ -7,11 +7,13 @@ struct SettingsView: View {
     var body: some View {
         TabView {
             GeneralSettingsView()
-                .tabItem { Text("General") }
+                .tabItem { Label("General", systemImage: "gear") }
             ModelsSettingsView()
-                .tabItem { Text("AI & Models") }
+                .tabItem { Label("AI & Models", systemImage: "cpu") }
+            ProfileSettingsView()
+                .tabItem { Label("Profiles", systemImage: "person.2.fill") }
         }
-        .frame(width: 520, height: 520)
+        .frame(width: 520, height: 560)
     }
 }
 

@@ -860,11 +860,20 @@ struct SmartSearchView: View {
     private func stopGenerating() {
         currentAITask?.cancel()
         currentAITask = nil
-        skipStreaming()
+        streamingTask?.cancel()
+        streamingTask = nil
         withAnimation(.easeOut(duration: 0.2)) {
             thinkingSteps = []
             isThinking = false
-            isSending = false
+        }
+        isSending = false
+        // Append a stop notice to partial assistant message if any
+        if let lastIdx = messages.indices.last, messages[lastIdx].role == .assistant {
+            if !messages[lastIdx].text.isEmpty {
+                messages[lastIdx].text += "\n\n*[Generation stopped]*"
+            } else {
+                messages.removeLast()
+            }
         }
     }
 
@@ -988,25 +997,21 @@ struct SmartSearchView: View {
         let detectedURLs = Self.extractURLs(from: prompt)
 
         let task = Task {
-            // Step 0: If the user included URLs, fetch them
+            // Step 0: fetch any URLs the user pasted
             var linkContext: String? = nil
             if !detectedURLs.isEmpty {
                 addThinkingStep("Reading \(detectedURLs.count == 1 ? "link" : "\(detectedURLs.count) links")\u{2026}")
                 var fetched: [WebSource] = []
                 for url in detectedURLs.prefix(3) {
                     guard !Task.isCancelled else { return }
-                    if let source = await WebSearchService.fetchSingleURL(url) {
-                        fetched.append(source)
-                    }
+                    if let source = await WebSearchService.fetchSingleURL(url) { fetched.append(source) }
                 }
                 guard !Task.isCancelled else { return }
-                if !fetched.isEmpty {
-                    linkContext = WebSearchService.formatSourcesAsContext(fetched)
-                }
+                if !fetched.isEmpty { linkContext = WebSearchService.formatSourcesAsContext(fetched) }
                 completeLastThinkingStep()
             }
 
-            // Step 1: Optional web search
+            // Step 1: optional web search
             var webContext: String? = nil
             if needsWebSearch && detectedURLs.isEmpty {
                 addThinkingStep("Searching the web\u{2026}")
@@ -1030,32 +1035,53 @@ struct SmartSearchView: View {
 
             let recentContext = Array(messages.dropLast().suffix(6))
             var contextParts: [String] = []
-            if let userContext = buildContextString() { contextParts.append(userContext) }
+            if let userCtx = buildContextString() { contextParts.append(userCtx) }
             if let link = linkContext { contextParts.append(link) }
             if let web = webContext { contextParts.append(web) }
             let finalContext = contextParts.isEmpty ? nil : contextParts.joined(separator: "\n\n")
 
             guard !Task.isCancelled else { return }
 
-            let handler: (Result<Data, Error>) -> Void = { result in
-                DispatchQueue.main.async {
-                    currentAITask = nil
-                    withAnimation(.easeOut(duration: 0.3)) {
-                        thinkingSteps = []
-                        isThinking = false
+            // Dismiss thinking steps and begin streaming
+            await MainActor.run {
+                currentAITask = nil
+                withAnimation(.easeOut(duration: 0.3)) {
+                    thinkingSteps = []
+                    isThinking = false
+                }
+                // Append placeholder for the streaming assistant message
+                messages.append(ChatMessage(role: .assistant, text: ""))
+            }
+
+            let assistantIndex = await MainActor.run { messages.count - 1 }
+
+            if let query = capturedQuery {
+                await MainActor.run { generateAITitle(for: query) }
+            }
+
+            let onToken: @Sendable (String) -> Void = { token in
+                Task { @MainActor in
+                    if assistantIndex < messages.count {
+                        messages[assistantIndex].text += token
                     }
+                }
+            }
+
+            let onCompletion: @Sendable (Result<Void, Error>) -> Void = { result in
+                Task { @MainActor in
+                    streamingTask = nil
+                    isSending = false
                     switch result {
-                    case .success(let data):
-                        if let response = try? JSONDecoder().decode(LLMResponse.self, from: data) {
-                            streamResponseWordByWord(response.text, capturedQuery: capturedQuery)
-                        } else {
-                            isSending = false
-                            errorMessage = "Failed to parse response"
-                        }
+                    case .success: break
                     case .failure(let error):
-                        isSending = false
-                        if !Task.isCancelled {
-                            errorMessage = error.localizedDescription
+                        let msg = error.localizedDescription
+                        errorMessage = msg
+                        if assistantIndex < messages.count {
+                            if messages[assistantIndex].text.isEmpty {
+                                messages[assistantIndex].text = "Error: \(msg)"
+                            } else {
+                                messages[assistantIndex].text += "\n\n*[Error: \(msg)]*"
+                            }
                         }
                     }
                 }
@@ -1064,61 +1090,27 @@ struct SmartSearchView: View {
             await MainActor.run {
                 switch aiProvider {
                 case .gemini:
-                    gemini.generate(prompt: prompt, context: finalContext,
-                                    recentMessages: recentContext, completion: handler)
+                    streamingTask = gemini.generateStreaming(
+                        prompt: prompt,
+                        context: finalContext,
+                        recentMessages: recentContext,
+                        onToken: onToken,
+                        onCompletion: onCompletion
+                    )
                 case .ollama:
-                    ollama.generate(baseURLString: ollamaBaseURL, model: ollamaModel,
-                                    prompt: prompt, context: finalContext,
-                                    recentMessages: recentContext, completion: handler)
+                    streamingTask = ollama.generateStreaming(
+                        baseURLString: ollamaBaseURL,
+                        model: ollamaModel,
+                        prompt: prompt,
+                        context: finalContext,
+                        recentMessages: recentContext,
+                        onToken: onToken,
+                        onCompletion: onCompletion
+                    )
                 }
             }
         }
         currentAITask = task
-    }
-
-    private func streamResponseWordByWord(_ fullText: String, capturedQuery: String?) {
-        let placeholder = ChatMessage(role: .assistant, text: "")
-        messages.append(placeholder)
-        let targetIndex = messages.count - 1
-
-        if let query = capturedQuery {
-            generateAITitle(for: query)
-        }
-
-        guard !fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            messages[targetIndex].text = fullText
-            isSending = false
-            return
-        }
-
-        streamingTask?.cancel()
-        streamingTask = Task { @MainActor in
-            var index = fullText.startIndex
-            while index < fullText.endIndex {
-                guard !Task.isCancelled else {
-                    messages[targetIndex].text = fullText
-                    break
-                }
-                // Skip whitespace (include it in the next reveal)
-                while index < fullText.endIndex && fullText[index].isWhitespace {
-                    index = fullText.index(after: index)
-                }
-                // Advance through one word
-                while index < fullText.endIndex && !fullText[index].isWhitespace {
-                    index = fullText.index(after: index)
-                }
-                messages[targetIndex].text = String(fullText[fullText.startIndex..<index])
-                try? await Task.sleep(nanoseconds: 30_000_000)
-            }
-            messages[targetIndex].text = fullText
-            isSending = false
-            streamingTask = nil
-        }
-    }
-
-    private func skipStreaming() {
-        streamingTask?.cancel()
-        streamingTask = nil
     }
 
     private static func extractURLs(from text: String) -> [URL] {

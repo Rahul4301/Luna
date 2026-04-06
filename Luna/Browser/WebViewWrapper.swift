@@ -292,7 +292,8 @@ final class WebViewWrapper: NSObject, ObservableObject, WKNavigationDelegate, WK
         if let wv = webViews[tabId] { return wv }
         // Standards-compliant config to avoid bot/fingerprint detection: persistent store, real UA, full JS, no document-start injection.
         let config = WKWebViewConfiguration()
-        config.websiteDataStore = .default()  // Persistent cookies/localStorage; never use .nonPersistent()
+        // Use per-profile data store so cookies/sessions are fully isolated between profiles.
+        config.websiteDataStore = ProfileManager.shared.activeDataStore
         // Enable JavaScript via per-navigation preferences (preferences.javaScriptEnabled is deprecated).
         config.defaultWebpagePreferences.allowsContentJavaScript = true
         // Enable Web Inspector + "Inspect Element" in context menu (macOS WebKit Developer Extras).
@@ -914,8 +915,8 @@ final class WebViewWrapper: NSObject, ObservableObject, WKNavigationDelegate, WK
         let id = tabManager.newTab(url: requestURL)
         // IMPORTANT: the returned WKWebView must be created with the provided `configuration`,
         // otherwise WebKit throws: "Returned WKWebView was not created with the given configuration."
-        // Use default data store so cookies/sessions are shared (Google OAuth popups persist).
-        configuration.websiteDataStore = .default()
+        // Use active profile data store so popups/OAuth stay within the same profile.
+        configuration.websiteDataStore = ProfileManager.shared.activeDataStore
         configuration.preferences.setValue(true, forKey: "developerExtrasEnabled")
         configuration.defaultWebpagePreferences.allowsContentJavaScript = true
         let wv = WKWebView(frame: .zero, configuration: configuration)

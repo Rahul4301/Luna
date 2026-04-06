@@ -46,10 +46,19 @@ if [ ! -f Signing.xcconfig ]; then
   echo ""
   echo "🔑 Creating Signing.xcconfig from template..."
   cp Signing.xcconfig.example Signing.xcconfig
-  echo "✅ Signing.xcconfig created. Open it and set your DEVELOPMENT_TEAM."
-  echo "   Get your Team ID: https://developer.apple.com/account#MembershipDetailsCard"
+  echo "✅ Signing.xcconfig created."
+  echo "   Add one line with your Personal Team ID (free Apple ID — not the paid program):"
+  echo "   DEVELOPMENT_TEAM = XXXXXXXXXX"
+  echo "   Never leave DEVELOPMENT_TEAM blank — that clears signing. Team ID:"
+  echo "   https://developer.apple.com/account#MembershipDetailsCard"
 else
   echo "✅ Signing.xcconfig already exists"
+  if ! grep -qE '^[[:space:]]*DEVELOPMENT_TEAM[[:space:]]*=[[:space:]]*[A-Za-z0-9]+' Signing.xcconfig 2>/dev/null; then
+    echo ""
+    echo "⚠️  Signing.xcconfig has no DEVELOPMENT_TEAM set. Add:"
+    echo "   DEVELOPMENT_TEAM = XXXXXXXXXX"
+    echo "   (Personal Team from Xcode → Settings → Accounts — \$0)"
+  fi
 fi
 
 echo ""

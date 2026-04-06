@@ -59,6 +59,8 @@ struct CommandSurfaceView: View {
     @State private var contextSectionExpanded: Bool = false
     @State private var conversationSummary: String? = nil
     @State private var lastSummarizedMessageCount: Int = 0
+    /// Active streaming task — cancel to stop generation.
+    @State private var streamingTask: Task<Void, Never>? = nil
     @FocusState private var isInputFocused: Bool
 
     @State private var pageTitle: String? = nil
@@ -174,6 +176,9 @@ struct CommandSurfaceView: View {
     }
     
     private func startNewChat() {
+        streamingTask?.cancel()
+        streamingTask = nil
+        isSending = false
         messages = []
         attachedDocuments = []
         includeCurrentTab = true
@@ -611,19 +616,33 @@ struct CommandSurfaceView: View {
                 )
                 .frame(maxWidth: .infinity)
 
-                Button(action: sendCommand) {
-                    Image(systemName: "arrow.up")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundColor(inputText.isEmpty || isSending
-                                         ? Color.white.opacity(0.3)
-                                         : Color.white.opacity(0.9))
-                        .frame(width: 28, height: minInputHeight)
-                        .contentShape(Rectangle())
+                if isSending {
+                    Button(action: stopStreaming) {
+                        Image(systemName: "stop.fill")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(Color.white.opacity(0.85))
+                            .frame(width: 28, height: minInputHeight)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Stop generating")
+                    .transition(.opacity.combined(with: .scale(scale: 0.8)))
+                } else {
+                    Button(action: sendCommand) {
+                        Image(systemName: "arrow.up")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundColor(inputText.isEmpty
+                                             ? Color.white.opacity(0.3)
+                                             : Color.white.opacity(0.9))
+                            .frame(width: 28, height: minInputHeight)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(inputText.isEmpty)
+                    .keyboardShortcut(.return, modifiers: [])
+                    .accessibilityLabel("Send message")
+                    .transition(.opacity.combined(with: .scale(scale: 0.8)))
                 }
-                .buttonStyle(.plain)
-                .disabled(inputText.isEmpty || isSending)
-                .keyboardShortcut(.return, modifiers: [])
-                .accessibilityLabel("Send message")
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
@@ -936,6 +955,8 @@ struct CommandSurfaceView: View {
     }
 
     private func close() {
+        streamingTask?.cancel()
+        streamingTask = nil
         isPresented = false
         inputText = ""
         errorMessage = nil
@@ -1066,70 +1087,81 @@ struct CommandSurfaceView: View {
         inputText = ""
 
         let context = buildContextString()
-        proceedWithSend(prompt: trimmed, context: context)
+        proceedWithStreaming(prompt: trimmed, context: context)
     }
 
-    private func proceedWithSend(prompt: String, context: String?) {
-        let promptToSend = prompt
-        let contextToSend = context
-        
-        // Only send last 4-6 messages for immediate context to save tokens
-        let recentContext = messages.dropLast().suffix(6)
+    private func stopStreaming() {
+        streamingTask?.cancel()
+        streamingTask = nil
+        isSending = false
+        // Mark partial response with a notice if there's content
+        if let lastIdx = messages.indices.last, messages[lastIdx].role == .assistant {
+            if !messages[lastIdx].text.isEmpty {
+                messages[lastIdx].text += "\n\n*[Generation stopped]*"
+            } else {
+                messages.removeLast()
+            }
+        }
+    }
 
-        let completionHandler: (Result<Data, Error>) -> Void = { result in
-            DispatchQueue.main.async {
-                isSending = false
+    private func proceedWithStreaming(prompt: String, context: String?) {
+        let recentContext = Array(messages.dropLast().suffix(6))
 
-                switch result {
-                case .success(let data):
-                    if let response = try? JSONDecoder().decode(LLMResponse.self, from: data) {
-                        let assistantMsg = ChatMessage(
-                            role: .assistant,
-                            text: response.text,
-                            pageURL: webViewWrapper.currentURL?.absoluteString,
-                            pageTitle: pageTitle
-                        )
-                        messages.append(assistantMsg)
-                        
-                        // Auto-summarize every 8 messages
-                        checkAndSummarize()
-                        
-                        if response.action != nil {
-                            onActionProposed(response)
-                            actionProposedMessage = "Action proposed"
-                        }
+        // Append placeholder for assistant response
+        let placeholder = ChatMessage(
+            role: .assistant,
+            text: "",
+            pageURL: webViewWrapper.currentURL?.absoluteString,
+            pageTitle: pageTitle
+        )
+        messages.append(placeholder)
+        let assistantIndex = messages.count - 1
+
+        let onToken: (String) -> Void = { token in
+            if assistantIndex < messages.count {
+                messages[assistantIndex].text += token
+            }
+        }
+
+        let onCompletion: (Result<Void, Error>) -> Void = { result in
+            isSending = false
+            streamingTask = nil
+            switch result {
+            case .success:
+                checkAndSummarize()
+            case .failure(let error):
+                let msg = error.localizedDescription
+                errorMessage = msg
+                if assistantIndex < messages.count {
+                    if messages[assistantIndex].text.isEmpty {
+                        messages[assistantIndex].text = "Error: \(msg)"
                     } else {
-                        errorMessage = "Failed to parse response"
+                        messages[assistantIndex].text += "\n\n*[Error: \(msg)]*"
                     }
-
-                case .failure(let error):
-                    let msg = error.localizedDescription
-                    errorMessage = msg
-                    let errorMsg = ChatMessage(role: .assistant, text: "Error: \(msg)")
-                    messages.append(errorMsg)
-                    actionProposedMessage = nil
                 }
             }
         }
 
         switch aiProvider {
         case .gemini:
-            gemini.generate(
-                prompt: promptToSend,
-                context: contextToSend,
-                recentMessages: Array(recentContext),
+            streamingTask = gemini.generateStreaming(
+                prompt: prompt,
+                context: context,
+                recentMessages: recentContext,
                 conversationSummary: conversationSummary,
-                completion: completionHandler
+                onToken: onToken,
+                onCompletion: onCompletion
             )
         case .ollama:
-            ollama.generate(
+            streamingTask = ollama.generateStreaming(
                 baseURLString: ollamaBaseURL,
                 model: ollamaModel,
-                prompt: promptToSend,
-                context: contextToSend,
-                recentMessages: Array(recentContext),
+                prompt: prompt,
+                context: context,
+                recentMessages: recentContext,
                 conversationSummary: conversationSummary,
-                completion: completionHandler
+                onToken: onToken,
+                onCompletion: onCompletion
             )
         }
     }
